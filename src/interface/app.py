@@ -1107,7 +1107,7 @@ class DrowsinessApp(ctk.CTk):
                 card, text=f1, font=ctk.CTkFont(size=12, weight="bold"), text_color=TEXT_MUTED
             ).pack(anchor="w", padx=16, pady=2)
             ctk.CTkLabel(
-                card, text=desc, font=ctk.CTkFont(size=12), text_color=TEXT_MUTED, justify="left"
+                card, text=desc, font=ctk.CTkFont(size=12), text_color=TEXT_MUTED, justify="left", wraplength=330
             ).pack(anchor="w", padx=16, pady=(6, 14))
 
         cm_frame = ctk.CTkFrame(
