@@ -1,0 +1,18 @@
+Test images: 15694
+Accuracy: 97.09%
+Precision (macro): 97.10%
+Recall (macro): 97.10%
+F1-score (macro): 97.09%
+
+              precision    recall  f1-score   support
+
+      closed       0.96      0.98      0.97      7814
+        open       0.98      0.96      0.97      7880
+
+    accuracy                           0.97     15694
+   macro avg       0.97      0.97      0.97     15694
+weighted avg       0.97      0.97      0.97     15694
+
+Confusion matrix:
+[[7651  163]
+ [ 293 7587]]

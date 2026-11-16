@@ -1,0 +1,28 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Datasets (raw MRL dataset and local webcam captures)
+data/raw/
+data/processed/
+data/conflict_backup/
+data/webcam_conflict_backup/
+data/webcam_dataset/
+data/webcam_split/
+
+# Local runtime logs and snapshots
+results/diagnostics/*.csv
+results/snapshots/*.png
+results/sessions.db
