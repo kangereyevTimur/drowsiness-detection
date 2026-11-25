@@ -12,6 +12,7 @@ from src.detection.eye_detector import (
     calculate_ear,
     crop_square_eye,
 )
+from src.detection.head_pose import HeadPoseEstimator
 from src.detection.multi_person import MultiPersonTracker
 from src.detection.yawn_detector import YawnDetector
 
@@ -129,15 +130,32 @@ class TestYawnAndDrowsinessEvaluator(unittest.TestCase):
         st_norm = evaluator.update(1.0, 1.0, False, False, 0.30, 1.0, landmarks, 640, 480)
         self.assertEqual(st_norm["level"], DrowsinessEvaluator.LEVEL_NORMAL)
 
-        # Симуляция непрерывного закрытия глаз на 2.5 секунды -> HIGH
+        # Первое короткое закрытие (2.0 с) без фона усталости не должно сразу бить HIGH
         evaluator.update(2.0, 2.0, False, True, 0.06, 0.2, landmarks, 640, 480)
-        st_high = evaluator.update(4.5, 4.5, False, True, 0.06, 0.2, landmarks, 640, 480)
+        st_mid = evaluator.update(4.0, 4.0, False, True, 0.06, 0.2, landmarks, 640, 480)
+        self.assertNotEqual(st_mid["level"], DrowsinessEvaluator.LEVEL_HIGH)
+
+        # Длительное закрытие (3.5 с) -> HIGH
+        st_high = evaluator.update(5.5, 5.5, False, True, 0.06, 0.2, landmarks, 640, 480)
         self.assertEqual(st_high["level"], DrowsinessEvaluator.LEVEL_HIGH)
-        self.assertGreaterEqual(st_high["score"], 65.0)
+        self.assertGreaterEqual(st_high["score"], 68.0)
         self.assertEqual(st_high["alerts_count"], 1)
+        self.assertTrue(len(st_high["recommendation"]) > 0)
+
+        # Проверка полного сброса счётчиков в reset()
+        evaluator.reset()
+        self.assertEqual(evaluator.alerts_count, 0)
+        self.assertEqual(sum(evaluator.state_durations.values()), 0.0)
+
+    def test_head_pose_estimator_neutral_and_nod(self):
+        hp = HeadPoseEstimator()
+        neutral = _make_landmarks()
+        hp.update(neutral, 640, 480, now_sec=0.0, is_calibrating=True)
+        res_ok = hp.update(neutral, 640, 480, now_sec=1.0, is_calibrating=False)
+        self.assertEqual(res_ok["pose_status"], "NORMAL")
 
     def test_multi_person_tracker_stable_ids(self):
-        tracker = MultiPersonTracker(window_seconds=60.0)
+        tracker = MultiPersonTracker(window_seconds=60.0, stale_timeout_sec=2.0)
         model = EyeCNN()
         model.eval()
         frame = np.zeros((480, 640, 3), dtype=np.uint8)
@@ -162,6 +180,11 @@ class TestYawnAndDrowsinessEvaluator(unittest.TestCase):
         res2 = tracker.process_frame(frame, [face_right, face_left], model, now_sec=0.1, cal_limit_sec=1.0)
         self.assertEqual(res2[0]["person_id"], id_right)
         self.assertEqual(res2[1]["person_id"], id_left)
+
+        # После истечения stale_timeout_sec при пустых кадрах треки очищаются
+        res_empty = tracker.process_frame(frame, [], model, now_sec=5.0, cal_limit_sec=1.0)
+        self.assertEqual(res_empty, [])
+        self.assertEqual(len(tracker.persons), 0)
 
 
 if __name__ == "__main__":

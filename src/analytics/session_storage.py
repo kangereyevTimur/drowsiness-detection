@@ -1,3 +1,4 @@
+import contextlib
 import csv
 import sqlite3
 from datetime import datetime
@@ -38,10 +39,11 @@ class SessionStorage:
         self.csv_path = csv_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
-        self._seed_from_existing_logs_if_empty()
+        if self.db_path == DB_PATH:
+            self._seed_from_existing_logs_if_empty()
 
     def _init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
+        with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sessions (
@@ -158,7 +160,7 @@ class SessionStorage:
             str(record.get("model_name", "eye_cnn_finetuned.pth")),
         ]
 
-        with sqlite3.connect(self.db_path) as conn:
+        with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
             cursor = conn.execute(
                 f"""
                 INSERT INTO sessions ({", ".join(self.COLUMNS)})
@@ -176,7 +178,7 @@ class SessionStorage:
         return session_id
 
     def get_recent_sessions(self, limit: int = 50) -> list[dict]:
-        with sqlite3.connect(self.db_path) as conn:
+        with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 "SELECT * FROM sessions ORDER BY id DESC LIMIT ?", (limit,)
@@ -184,7 +186,7 @@ class SessionStorage:
             return [dict(r) for r in rows]
 
     def get_summary_stats(self) -> dict:
-        with sqlite3.connect(self.db_path) as conn:
+        with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
             row = conn.execute(
                 """
                 SELECT

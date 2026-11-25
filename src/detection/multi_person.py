@@ -5,7 +5,6 @@ import torch
 
 from src.detection.drowsiness_detector import DrowsinessEvaluator
 from src.detection.eye_detector import (
-    DEVICE,
     LEFT_EYE_LANDMARKS,
     RIGHT_EYE_LANDMARKS,
     StabilizedEyeTracker,
@@ -39,6 +38,11 @@ def _face_centroid_and_box(landmarks, frame_w: int, frame_h: int):
     return (cx, cy), (x1, y1, x2, y2)
 
 
+def _safe_mean(values: list[float], default: float = 0.25) -> float:
+    finite = [v for v in values if np.isfinite(v)]
+    return float(np.mean(finite)) if finite else default
+
+
 class MultiPersonTracker:
     """
     Отслеживает от 1 до N человек в кадре одновременно.
@@ -49,8 +53,8 @@ class MultiPersonTracker:
     def __init__(
         self,
         window_seconds: float = 60.0,
-        max_match_dist: float = 0.22,
-        stale_timeout_sec: float = 2.5,
+        max_match_dist: float = 0.28,
+        stale_timeout_sec: float = 10.0,
     ):
         self.window_seconds = window_seconds
         self.max_match_dist = max_match_dist
@@ -77,8 +81,7 @@ class MultiPersonTracker:
         for p in self.persons.values():
             p.evaluator.sensitivity_multiplier = multiplier
 
-    def _match_faces(self, centroids: list[tuple[float, float]], now_sec: float) -> list[TrackedPerson]:
-        # Удаляем давно пропавших из кадра людей
+    def _prune_stale(self, now_sec: float):
         stale_ids = [
             pid for pid, p in self.persons.items()
             if (now_sec - p.last_seen_sec) > self.stale_timeout_sec
@@ -86,14 +89,18 @@ class MultiPersonTracker:
         for pid in stale_ids:
             del self.persons[pid]
 
-        # Жадное сопоставление пар (лицо, существующий трек) по минимальному расстоянию
+    def _match_faces(self, centroids: list[tuple[float, float]], now_sec: float) -> list[TrackedPerson]:
+        self._prune_stale(now_sec)
+
         existing_ids = list(self.persons.keys())
         pairs = []
         for f_idx, (cx, cy) in enumerate(centroids):
             for pid in existing_ids:
                 px, py = self.persons[pid].centroid
                 dist = float(np.hypot(cx - px, cy - py))
-                if dist <= self.max_match_dist:
+                # Если в кадре 1 человек и 1 активный трек — допускаем большее смещение
+                limit = 0.55 if (len(centroids) == 1 and len(existing_ids) == 1) else self.max_match_dist
+                if dist <= limit:
                     pairs.append((dist, f_idx, pid))
         pairs.sort(key=lambda item: item[0])
 
@@ -108,7 +115,6 @@ class MultiPersonTracker:
             matched_face[f_idx] = person
             used_pids.add(pid)
 
-        # Для новых несопоставленных лиц создаём новый трек
         ordered_persons = []
         for f_idx, centroid in enumerate(centroids):
             if f_idx in matched_face:
@@ -144,31 +150,31 @@ class MultiPersonTracker:
         Возвращает список словарей с результатами по каждому человеку.
         """
         if not face_landmarks_list:
+            self._prune_stale(now_sec)
             return []
 
         h, w = frame.shape[:2]
-        centroids = []
-        face_boxes = []
+
+        # Сначала отбираем только те лица, у которых успешно вырезаны оба глаза
+        cropped_faces = []
         for lm in face_landmarks_list:
-            c, box = _face_centroid_and_box(lm, w, h)
-            centroids.append(c)
-            face_boxes.append(box)
-
-        matched_persons = self._match_faces(centroids, now_sec)
-
-        # Собираем кропы всех глаз со всех лиц для одного батч-инференса EyeCNN
-        valid_entries = []
-        tensors = []
-        for lm, face_box, person in zip(face_landmarks_list, face_boxes, matched_persons):
             left_crop = crop_square_eye(frame, lm, LEFT_EYE_LANDMARKS)
             right_crop = crop_square_eye(frame, lm, RIGHT_EYE_LANDMARKS)
             if left_crop is not None and right_crop is not None:
-                valid_entries.append((lm, face_box, person, left_crop, right_crop))
-                tensors.append(left_crop[1])
-                tensors.append(right_crop[1])
+                c, box = _face_centroid_and_box(lm, w, h)
+                cropped_faces.append((lm, c, box, left_crop, right_crop))
 
-        if not valid_entries:
+        if not cropped_faces:
+            self._prune_stale(now_sec)
             return []
+
+        centroids = [item[1] for item in cropped_faces]
+        matched_persons = self._match_faces(centroids, now_sec)
+
+        tensors = []
+        for _, _, _, left_crop, right_crop in cropped_faces:
+            tensors.append(left_crop[1])
+            tensors.append(right_crop[1])
 
         model_device = next(model.parameters()).device
         batch = torch.stack(tensors).to(model_device)
@@ -176,7 +182,7 @@ class MultiPersonTracker:
             all_probs = torch.softmax(model(batch), dim=1)[:, 0].cpu().tolist()
 
         results = []
-        for idx, (lm, face_box, person, left_crop, right_crop) in enumerate(valid_entries):
+        for idx, ((lm, _, face_box, left_crop, right_crop), person) in enumerate(zip(cropped_faces, matched_persons)):
             prob_l = float(all_probs[idx * 2])
             prob_r = float(all_probs[idx * 2 + 1])
 
@@ -191,8 +197,8 @@ class MultiPersonTracker:
             r_closed, r_sq, _, r_ratio = person.right_tracker.update(prob_r, r_ear, is_calibrating)
 
             both_closed = l_closed and r_closed
-            mean_ear = float(np.nanmean([l_ear, r_ear]))
-            mean_ratio = float(np.nanmean([l_ratio, r_ratio]))
+            mean_ear = _safe_mean([l_ear, r_ear], default=0.25)
+            mean_ratio = _safe_mean([l_ratio, r_ratio], default=1.0)
 
             status = person.evaluator.update(
                 now_sec=now_sec,
@@ -215,8 +221,8 @@ class MultiPersonTracker:
                 "right_crop": right_crop,
                 "prob_l": prob_l,
                 "prob_r": prob_r,
-                "l_ear": l_ear,
-                "r_ear": r_ear,
+                "l_ear": l_ear if np.isfinite(l_ear) else 0.0,
+                "r_ear": r_ear if np.isfinite(r_ear) else 0.0,
                 "l_closed": l_closed,
                 "r_closed": r_closed,
                 "l_sq": l_sq,

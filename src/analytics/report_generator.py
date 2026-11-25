@@ -33,7 +33,13 @@ def generate_session_report_png(csv_path: Path | None = None) -> Path | None:
 
     df = pd.read_csv(target_csv)
     if len(df) < 5 or "timestamp_ms" not in df.columns:
-        return None
+        fallback = find_latest_session_csv()
+        if fallback is None or fallback == target_csv or not fallback.exists():
+            return None
+        target_csv = fallback
+        df = pd.read_csv(target_csv)
+        if len(df) < 5 or "timestamp_ms" not in df.columns:
+            return None
 
     t_sec = (df["timestamp_ms"] - df["timestamp_ms"].iloc[0]) / 1000.0
     # Защита от разрывов времени при спящем режиме
