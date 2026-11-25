@@ -25,13 +25,9 @@ from src.detection.eye_detector import (
     BASE_CNN_PATH,
     DEVICE,
     FINETUNED_CNN_PATH,
-    LEFT_EYE_LANDMARKS,
-    RIGHT_EYE_LANDMARKS,
     EyeCNN,
-    StabilizedEyeTracker,
-    calculate_ear,
-    crop_square_eye,
 )
+from src.detection.multi_person import MultiPersonTracker
 
 LANDMARKER_PATH = ROOT / "models" / "face_landmarker.task"
 DIAG_DIR = ROOT / "results" / "diagnostics"
@@ -95,8 +91,8 @@ class DrowsinessApp(ctk.CTk):
         self.landmarker = None
         self.storage = SessionStorage()
 
-        self.trackers = [StabilizedEyeTracker("Left"), StabilizedEyeTracker("Right")]
-        self.evaluator = DrowsinessEvaluator(window_seconds=60.0)
+        self.multi_tracker = MultiPersonTracker(window_seconds=60.0)
+        self.max_faces = 4
 
         self.session_start_dt = None
         self.app_start_mono = 0.0
@@ -165,7 +161,19 @@ class DrowsinessApp(ctk.CTk):
             "Высокая чувств.": 1.25,
             "Мягкий": 0.80,
         }
-        self.evaluator.sensitivity_multiplier = mapping.get(choice, 1.0)
+        self.multi_tracker.set_sensitivity(mapping.get(choice, 1.0))
+
+    def _on_faces_mode_select(self, choice: str):
+        self.max_faces = 4 if "4" in choice else 1
+        if self.is_running and self.landmarker is not None:
+            self.landmarker.close()
+            options = mp.tasks.vision.FaceLandmarkerOptions(
+                base_options=mp.tasks.BaseOptions(model_asset_path=str(LANDMARKER_PATH)),
+                running_mode=mp.tasks.vision.RunningMode.VIDEO,
+                num_faces=self.max_faces,
+            )
+            self.landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(options)
+            self.multi_tracker.reset()
 
     # =========================================================================
     # ПОСТРОЕНИЕ ИНТЕРФЕЙСА (OBSIDIAN + ELECTRIC LAVENDER)
@@ -225,6 +233,20 @@ class DrowsinessApp(ctk.CTk):
         # Селекторы справа
         right_nav = ctk.CTkFrame(navbar, fg_color="transparent")
         right_nav.grid(row=0, column=6, padx=36, pady=12, sticky="e")
+
+        self.faces_menu = ctk.CTkOptionMenu(
+            right_nav,
+            values=["До 4 человек", "1 человек"],
+            width=128,
+            height=30,
+            fg_color=BG_CARD,
+            button_color=BG_ELEVATED,
+            button_hover_color=BORDER_HAIRLINE,
+            text_color=TEXT_LAVENDER,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self._on_faces_mode_select,
+        )
+        self.faces_menu.pack(side="left", padx=5)
 
         self.sens_menu = ctk.CTkOptionMenu(
             right_nav,
@@ -1230,13 +1252,11 @@ class DrowsinessApp(ctk.CTk):
         options = mp.tasks.vision.FaceLandmarkerOptions(
             base_options=mp.tasks.BaseOptions(model_asset_path=str(LANDMARKER_PATH)),
             running_mode=mp.tasks.vision.RunningMode.VIDEO,
-            num_faces=1,
+            num_faces=self.max_faces,
         )
         self.landmarker = mp.tasks.vision.FaceLandmarker.create_from_options(options)
 
-        for tr in self.trackers:
-            tr.reset()
-        self.evaluator.reset()
+        self.multi_tracker.reset()
         self._on_sensitivity_select(self.sens_menu.get())
         self.perclos_samples.clear()
         self.score_history = deque([0.0] * self.chart_history_len, maxlen=self.chart_history_len)
@@ -1271,10 +1291,9 @@ class DrowsinessApp(ctk.CTk):
     def recalibrate(self):
         if not self.is_running:
             return
-        self.calibration_start_mono = time.monotonic()
-        for tr in self.trackers:
-            tr.reset()
-        self.evaluator.reset()
+        now = time.monotonic()
+        self.calibration_start_mono = now
+        self.multi_tracker.recalibrate_all(now)
         self._on_sensitivity_select(self.sens_menu.get())
 
     def stop_monitoring(self):
@@ -1377,10 +1396,7 @@ class DrowsinessApp(ctk.CTk):
         )
 
         h, w = frame.shape[:2]
-        elapsed_cal = now - self.calibration_start_mono
         cal_limit = 2.0 if self.is_video_file else CALIBRATION_SECONDS
-        is_calibrating = elapsed_cal < cal_limit
-        rem_cal = max(0.0, cal_limit - elapsed_cal)
 
         ts = max(int((now - self.app_start_mono) * 1000), self.last_timestamp_ms + 1)
         self.last_timestamp_ms = ts
@@ -1388,57 +1404,68 @@ class DrowsinessApp(ctk.CTk):
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         res = self.landmarker.detect_for_video(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), ts)
 
-        if res.face_landmarks:
-            lm = res.face_landmarks[0]
+        people = (
+            self.multi_tracker.process_frame(frame, res.face_landmarks, self.model, now, cal_limit)
+            if res.face_landmarks
+            else []
+        )
 
-            if self.show_mesh_var.get():
-                for idx in FACE_MESH_KEYPOINTS:
-                    px = int(lm[idx].x * w)
-                    py = int(lm[idx].y * h)
-                    cv2.circle(frame, (px, py), 2, (250, 180, 196), -1, cv2.LINE_AA)
+        self.lbl_timer_fps.configure(
+            text=f"{mm:02d}:{ss:02d}   /   {fps_val:.1f} FPS   /   ЛЮДЕЙ: {len(people)}   /   {self.video_source_name}"
+        )
 
-            left_crop = crop_square_eye(frame, lm, LEFT_EYE_LANDMARKS)
-            right_crop = crop_square_eye(frame, lm, RIGHT_EYE_LANDMARKS)
+        if people:
+            any_high_alert = False
+            high_ids = []
 
-            if left_crop is not None and right_crop is not None:
-                batch = torch.stack([left_crop[1], right_crop[1]]).to(DEVICE)
-                with torch.inference_mode():
-                    probs = torch.softmax(self.model(batch), dim=1)[:, 0].cpu().tolist()
+            for p in people:
+                lm = p["landmarks"]
+                status = p["status"]
+                pid = p["person_id"]
+                fx1, fy1, fx2, fy2 = p["face_box"]
+                is_cal = p["is_calibrating"]
+                rem_cal = p["rem_cal"]
 
-                l_ear = calculate_ear(lm, LEFT_EYE_LANDMARKS, w, h)
-                r_ear = calculate_ear(lm, RIGHT_EYE_LANDMARKS, w, h)
+                if self.show_mesh_var.get():
+                    for idx in FACE_MESH_KEYPOINTS:
+                        px = int(lm[idx].x * w)
+                        py = int(lm[idx].y * h)
+                        cv2.circle(frame, (px, py), 2, (250, 180, 196), -1, cv2.LINE_AA)
 
-                l_closed, l_sq, _, l_ratio = self.trackers[0].update(probs[0], l_ear, is_calibrating)
-                r_closed, r_sq, _, r_ratio = self.trackers[1].update(probs[1], r_ear, is_calibrating)
+                # Индивидуальная рамка и бейдж над каждым человеком
+                if is_cal:
+                    f_col = (245, 180, 195)
+                    tag = f"ID #{pid} | CAL {rem_cal:.1f}s"
+                elif status["level"] == DrowsinessEvaluator.LEVEL_HIGH:
+                    f_col = (60, 60, 240)
+                    tag = f"ID #{pid} | HIGH | {status['score']:.0f}"
+                    any_high_alert = True
+                    high_ids.append(f"#{pid}")
+                elif status["level"] == DrowsinessEvaluator.LEVEL_ELEVATED:
+                    f_col = (0, 185, 245)
+                    tag = f"ID #{pid} | ELEVATED | {status['score']:.0f}"
+                else:
+                    f_col = (110, 210, 90)
+                    tag = f"ID #{pid} | OK | {status['score']:.0f}"
 
-                both_closed = l_closed and r_closed
-                mean_ear = float(np.nanmean([l_ear, r_ear]))
-                mean_ratio = float(np.nanmean([l_ratio, r_ratio]))
-
-                status = self.evaluator.update(
-                    now_sec=now,
-                    elapsed_session_sec=max(0.1, elapsed_cal - cal_limit),
-                    is_calibrating=is_calibrating,
-                    both_closed=both_closed,
-                    mean_ear=mean_ear,
-                    mean_ear_ratio=mean_ratio,
-                    landmarks=lm,
-                    frame_w=w,
-                    frame_h=h,
-                )
-                self.last_status = status
-                if not is_calibrating:
-                    self.perclos_samples.append(status["perclos"])
-
-                self.score_history.append(status["score"])
-                self.perclos_history.append(status["perclos"])
-                if self.metrics_visible:
-                    self._draw_live_chart()
+                if len(people) > 1 or self.show_boxes_var.get():
+                    cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), f_col, 2)
+                    cv2.rectangle(frame, (fx1, max(0, fy1 - 24)), (min(w, fx1 + 215), fy1), f_col, -1)
+                    cv2.putText(
+                        frame,
+                        tag,
+                        (fx1 + 6, max(16, fy1 - 7)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.48,
+                        (15, 15, 20),
+                        1,
+                        cv2.LINE_AA,
+                    )
 
                 if self.show_boxes_var.get():
                     for crop_data, name, is_c, is_s, prob, ear_v in [
-                        (left_crop, "L", l_closed, l_sq, probs[0], l_ear),
-                        (right_crop, "R", r_closed, r_sq, probs[1], r_ear),
+                        (p["left_crop"], "L", p["l_closed"], p["l_sq"], p["prob_l"], p["l_ear"]),
+                        (p["right_crop"], "R", p["r_closed"], p["r_sq"], p["prob_r"], p["r_ear"]),
                     ]:
                         box = crop_data[0]
                         if is_c:
@@ -1448,16 +1475,17 @@ class DrowsinessApp(ctk.CTk):
                         else:
                             col, st = (245, 180, 195), "OPEN"
                         cv2.rectangle(frame, (box[0], box[1]), (box[2], box[3]), col, 2)
-                        cv2.putText(
-                            frame,
-                            f"{name}:{st} P:{prob:.2f} EAR:{ear_v:.2f}",
-                            (box[0], max(22, box[1] - 8)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.45,
-                            col,
-                            1,
-                            cv2.LINE_AA,
-                        )
+                        if len(people) == 1:
+                            cv2.putText(
+                                frame,
+                                f"{name}:{st} P:{prob:.2f} EAR:{ear_v:.2f}",
+                                (box[0], max(22, box[1] - 8)),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.45,
+                                col,
+                                1,
+                                cv2.LINE_AA,
+                            )
 
                     yawn = status["yawn"]
                     m_box = yawn.get("mouth_box")
@@ -1480,43 +1508,62 @@ class DrowsinessApp(ctk.CTk):
                             cv2.LINE_AA,
                         )
 
-                if status["level"] == DrowsinessEvaluator.LEVEL_HIGH and not is_calibrating:
-                    cv2.rectangle(frame, (w // 2 - 235, 14), (w // 2 + 235, 70), (30, 25, 210), -1)
-                    cv2.putText(
-                        frame,
-                        "DROWSINESS ALERT",
-                        (w // 2 - 145, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.85,
-                        (255, 255, 255),
-                        2,
-                        cv2.LINE_AA,
-                    )
-                    self._trigger_alert_feedback()
-
-                if self.csv_writer is not None:
-                    pose = status["pose"]
-                    yawn = status["yawn"]
-                    self.csv_writer.writerow([
-                        ts, status["level"], f"{status['score']:.2f}", f"{status['perclos']:.2f}",
-                        f"{status['blink_rate_per_min']:.2f}", f"{status['avg_blink_duration_ms']:.1f}",
-                        f"{status['closure_duration_sec']:.2f}", f"{probs[0]:.4f}", f"{probs[1]:.4f}",
-                        f"{l_ear:.4f}", f"{r_ear:.4f}", int(l_closed), int(r_closed), int(both_closed),
-                        f"{pose['pitch_deg']:.1f}", f"{pose['yaw_deg']:.1f}", f"{pose['roll_deg']:.1f}",
-                        f"{yawn['mar']:.3f}", yawn["total_yawns"]
-                    ])
-
-                self._update_telemetry_widgets(
-                    status,
-                    is_calibrating,
-                    rem_cal,
-                    left_crop[2],
-                    right_crop[2],
-                    probs[0],
-                    probs[1],
-                    l_closed,
-                    r_closed,
+            if any_high_alert:
+                alert_text = (
+                    f"DROWSINESS ALERT ({', '.join(high_ids)})"
+                    if len(people) > 1
+                    else "DROWSINESS ALERT"
                 )
+                cv2.rectangle(frame, (w // 2 - 255, 14), (w // 2 + 255, 70), (30, 25, 210), -1)
+                cv2.putText(
+                    frame,
+                    alert_text,
+                    (w // 2 - 220, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.82,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+                self._trigger_alert_feedback()
+
+            # Выбираем человека с наивысшим риском для главной панели телеметрии и CSV-лога
+            primary = max(people, key=lambda item: (item["status"]["score"], -item["person_id"]))
+            p_status = primary["status"]
+            self.last_status = p_status
+            if not primary["is_calibrating"]:
+                self.perclos_samples.append(p_status["perclos"])
+
+            self.score_history.append(p_status["score"])
+            self.perclos_history.append(p_status["perclos"])
+            if self.metrics_visible:
+                self._draw_live_chart()
+
+            if self.csv_writer is not None:
+                pose = p_status["pose"]
+                yawn = p_status["yawn"]
+                self.csv_writer.writerow([
+                    ts, p_status["level"], f"{p_status['score']:.2f}", f"{p_status['perclos']:.2f}",
+                    f"{p_status['blink_rate_per_min']:.2f}", f"{p_status['avg_blink_duration_ms']:.1f}",
+                    f"{p_status['closure_duration_sec']:.2f}", f"{primary['prob_l']:.4f}", f"{primary['prob_r']:.4f}",
+                    f"{primary['l_ear']:.4f}", f"{primary['r_ear']:.4f}", int(primary["l_closed"]), int(primary["r_closed"]),
+                    int(primary["both_closed"]), f"{pose['pitch_deg']:.1f}", f"{pose['yaw_deg']:.1f}", f"{pose['roll_deg']:.1f}",
+                    f"{yawn['mar']:.3f}", yawn["total_yawns"]
+                ])
+
+            self._update_telemetry_widgets(
+                p_status,
+                primary["is_calibrating"],
+                primary["rem_cal"],
+                primary["left_crop"][2],
+                primary["right_crop"][2],
+                primary["prob_l"],
+                primary["prob_r"],
+                primary["l_closed"],
+                primary["r_closed"],
+                person_id=primary["person_id"],
+                total_people=len(people),
+            )
         else:
             cv2.putText(
                 frame,
@@ -1554,6 +1601,8 @@ class DrowsinessApp(ctk.CTk):
         prob_r: float,
         l_closed: bool,
         r_closed: bool,
+        person_id: int = 1,
+        total_people: int = 1,
     ):
         score = status["score"]
         perclos = status["perclos"]
@@ -1564,22 +1613,26 @@ class DrowsinessApp(ctk.CTk):
         self.lbl_perclos_val.configure(text=f"{perclos:.1f}%")
         self.bar_perclos.set(min(1.0, max(0.0, perclos / 40.0)))
 
+        id_suffix = f" (ID #{person_id} из {total_people})" if total_people > 1 else ""
+
         if is_calibrating:
-            self.lbl_state.configure(text=f"СТАТУС: КАЛИБРОВКА ({rem_cal:.1f} С)", text_color=TEXT_LAVENDER)
+            self.lbl_state.configure(
+                text=f"СТАТУС: КАЛИБРОВКА ({rem_cal:.1f} С){id_suffix}", text_color=TEXT_LAVENDER
+            )
             self.bar_score.configure(progress_color=ACCENT_VIOLET)
             self.video_showcase.configure(border_color=BORDER_VIOLET)
         else:
             lvl = status["level"]
             if lvl == DrowsinessEvaluator.LEVEL_HIGH:
-                self.lbl_state.configure(text="СТАТУС: ВЫСОКАЯ СОНЛИВОСТЬ", text_color=STATUS_RED)
+                self.lbl_state.configure(text=f"СТАТУС: ВЫСОКАЯ СОНЛИВОСТЬ{id_suffix}", text_color=STATUS_RED)
                 self.bar_score.configure(progress_color=STATUS_RED)
                 self.video_showcase.configure(border_color=STATUS_RED)
             elif lvl == DrowsinessEvaluator.LEVEL_ELEVATED:
-                self.lbl_state.configure(text="СТАТУС: ПОВЫШЕННАЯ УСТАЛОСТЬ", text_color=STATUS_AMBER)
+                self.lbl_state.configure(text=f"СТАТУС: ПОВЫШЕННАЯ УСТАЛОСТЬ{id_suffix}", text_color=STATUS_AMBER)
                 self.bar_score.configure(progress_color=STATUS_AMBER)
                 self.video_showcase.configure(border_color=STATUS_AMBER)
             else:
-                self.lbl_state.configure(text="СТАТУС: НОРМАЛЬНОЕ СОСТОЯНИЕ", text_color=STATUS_GREEN)
+                self.lbl_state.configure(text=f"СТАТУС: НОРМАЛЬНОЕ СОСТОЯНИЕ{id_suffix}", text_color=STATUS_GREEN)
                 self.bar_score.configure(progress_color=STATUS_GREEN)
                 self.video_showcase.configure(border_color=BORDER_VIOLET)
 

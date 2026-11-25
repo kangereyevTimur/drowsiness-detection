@@ -12,6 +12,7 @@ from src.detection.eye_detector import (
     calculate_ear,
     crop_square_eye,
 )
+from src.detection.multi_person import MultiPersonTracker
 from src.detection.yawn_detector import YawnDetector
 
 
@@ -134,6 +135,33 @@ class TestYawnAndDrowsinessEvaluator(unittest.TestCase):
         self.assertEqual(st_high["level"], DrowsinessEvaluator.LEVEL_HIGH)
         self.assertGreaterEqual(st_high["score"], 65.0)
         self.assertEqual(st_high["alerts_count"], 1)
+
+    def test_multi_person_tracker_stable_ids(self):
+        tracker = MultiPersonTracker(window_seconds=60.0)
+        model = EyeCNN()
+        model.eval()
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        # Лицо слева (x ~ 0.25) и лицо справа (x ~ 0.75)
+        def shift_face(dx: float):
+            pts = _make_landmarks()
+            for p in pts:
+                p.x = float(np.clip(p.x + dx, 0.02, 0.98))
+            return pts
+
+        face_left = shift_face(-0.22)
+        face_right = shift_face(+0.22)
+
+        res1 = tracker.process_frame(frame, [face_left, face_right], model, now_sec=0.0, cal_limit_sec=1.0)
+        self.assertEqual(len(res1), 2)
+        id_left = res1[0]["person_id"]
+        id_right = res1[1]["person_id"]
+        self.assertNotEqual(id_left, id_right)
+
+        # Меняем порядок лиц в списке от MediaPipe — ID должны сохраниться за теми же людьми
+        res2 = tracker.process_frame(frame, [face_right, face_left], model, now_sec=0.1, cal_limit_sec=1.0)
+        self.assertEqual(res2[0]["person_id"], id_right)
+        self.assertEqual(res2[1]["person_id"], id_left)
 
 
 if __name__ == "__main__":
